@@ -13,4 +13,4 @@ uv sync
 uv run python main.py
 ```
 
-**Requirements:** `efficientnet.pth` and `biasnn.pth` in project root. Uses CIFAR-10 for testing.
+**Requirements:** `biasnn.pth` in project root, else ResNet-18 will download. Uses CIFAR-10 for testing. 
