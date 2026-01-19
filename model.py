@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import os
 from torchvision import transforms, models
 from torchvision.datasets import CIFAR10
 from torch.utils.data import DataLoader
@@ -15,7 +16,8 @@ def _adapt_head(model: nn.Module, num_classes: int = 10) -> nn.Module:
             in_f = last.in_features
             model.classifier[-1] = nn.Linear(in_f, num_classes)
         else:
-            model.classifier = nn.Sequential(nn.Linear(getattr(last, 'in_features', 1280), num_classes))
+            model.classifier = nn.Sequential(
+                nn.Linear(getattr(last, 'in_features', 1280), num_classes))
         return model
 
     # ResNet-style fc
@@ -27,20 +29,14 @@ def _adapt_head(model: nn.Module, num_classes: int = 10) -> nn.Module:
     # Fallback: try to replace last Linear module found
     for name, module in reversed(list(model.named_modules())):
         if isinstance(module, nn.Linear):
-            # don't attempt complex setattr; just leave as-is and warn
+            # Don't attempt complex setattr, just leave as-is
             return model
 
     return model
 
 
 def load_pretrained(path: str, num_classes: int = 10, device: torch.device | None = None) -> nn.Module:
-    """Load a pretrained model, adapt head to `num_classes`, and move to `device`.
-
-    Special values for `path`:
-      - 'efficientnet.pth' -> torchvision EfficientNet-B0 with ImageNet weights
-      - 'biasnn.pth' -> torchvision ResNet18 (placeholder for BIASNN)
-    If `path` is a real file path, it will be loaded with `torch.load`.
-    """
+    """Load a pretrained model, adapt head to `num_classes`, and move to `device`."""
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -67,297 +63,413 @@ def load_pretrained(path: str, num_classes: int = 10, device: torch.device | Non
 
 
 class HybridModel(nn.Module):
-    """Hybrid model that stitches the first `cut_point` children of model A
-    with the remaining children of model B, adding an adapter if needed.
-    """
+    """Hybrid model that stitches parts of model A and model B with an adapter."""
 
-    def __init__(self, model_a_path: str, model_b_path: str, cut_point: int, input_shape=(3, 224, 224), device: torch.device | None = None):
+    def __init__(self, model_a_path: str, model_b_path: str, cut_point: int | None = None, 
+                 input_shape=(3, 224, 224), device: torch.device | None = None, 
+                 cut_by_half: bool = True, cut_a: int | None = None, cut_b: int | None = None):
         super().__init__()
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+        self.device = device
+        self._needs_unflatten = False  # Initialize flag
+        
+        # Load models
         model_a = load_pretrained(model_a_path, device=device)
         model_b = load_pretrained(model_b_path, device=device)
-
-        children_a = list(model_a.children()) 
+        
+        # Determine cut points
+        children_a = list(model_a.children())
         children_b = list(model_b.children())
-
-        self.encoder = nn.Sequential(*children_a[:cut_point])
-        self.decoder = nn.Sequential(*children_b[cut_point:])
-        self.encoder.to(device)
-        self.decoder.to(device)
-
-        # snapshot device
-        self.device = device
-
-        # determine encoder output shape with a dummy input
+        
+        # Use explicit cut points if provided, otherwise determine automatically
+        if cut_a is not None and cut_b is not None:
+            # Use user-specified cut points
+            print(f"\nHybrid Construction:")
+            print(f"  Model A: {len(children_a)} layers, using first {cut_a}")
+            print(f"  Model B: {len(children_b)} layers, using last {len(children_b) - cut_b}")
+        else:
+            # Auto-determine cut points
+            cut_a, cut_b = self._determine_cut_points(children_a, children_b, cut_point, cut_by_half)
+            print(f"\nHybrid Construction:")
+            print(f"  Model A: {len(children_a)} layers, using first {cut_a}")
+            print(f"  Model B: {len(children_b)} layers, using last {len(children_b) - cut_b}")
+        
+        # Create encoder/decoder
+        self.encoder = nn.Sequential(*children_a[:cut_a]).to(device)
+        decoder_layers = children_b[cut_b:]
+        
+        # For ResNet-style decoders: if we have residual blocks but also pooling+Linear,
+        # use only the residual blocks and add our own pooling+classifier
+        has_pool_linear = any(isinstance(l, (nn.AdaptiveAvgPool2d, nn.Linear)) for l in decoder_layers)
+        if has_pool_linear:
+            # Remove pooling and Linear layers, keep only Sequential blocks
+            conv_layers = [l for l in decoder_layers if isinstance(l, nn.Sequential)]
+            if conv_layers:
+                self.decoder = nn.Sequential(*conv_layers).to(device)
+                self._decoder_needs_head = True
+                print(f"  Decoder: using {len(conv_layers)} convolutional blocks, will add pooling+classifier")
+            else:
+                self.decoder = nn.Sequential(*decoder_layers).to(device)
+                self._decoder_needs_head = False
+        else:
+            self.decoder = nn.Sequential(*decoder_layers).to(device)
+            self._decoder_needs_head = False
+        
+        # Analyze input/output shapes
         dummy = torch.randn(1, *input_shape, device=device)
         with torch.no_grad():
             enc_out = self.encoder(dummy)
-
-        # encoder output info
-        self._enc_ndim = enc_out.ndim
-        if self._enc_ndim > 2:
-            # keep channels and spatial info
-            self._enc_channels = enc_out.shape[1]
-            self._enc_spatial = tuple(enc_out.shape[2:])
-            # flattened dim if needed
-            enc_flat = enc_out.view(enc_out.size(0), -1)
-            enc_dim = enc_flat.shape[1]
-            self.flatten = False  # do NOT flatten 4D outputs by default
+        
+        # Extract encoder output info
+        enc_info = self._analyze_encoder_output(enc_out)
+        print(f"  Encoder output: {enc_out.shape}")
+        
+        # Get decoder input requirements
+        dec_first_layer = self._get_first_meaningful_layer(self.decoder)
+        print(f"  Decoder first layer: {type(dec_first_layer).__name__ if dec_first_layer else 'None'}")
+        if dec_first_layer:
+            if isinstance(dec_first_layer, nn.Conv2d):
+                print(f"    Expects Conv2d input: in_channels={dec_first_layer.in_channels}")
+            elif isinstance(dec_first_layer, nn.Linear):
+                print(f"    Expects Linear input: in_features={dec_first_layer.in_features}")
+        
+        # Create adapter based on compatibility analysis
+        self.adapter = self._create_compatible_adapter(enc_info, dec_first_layer)
+        if self.adapter:
+            print(f"  Adapter created: {type(self.adapter).__name__}")
         else:
-            self._enc_channels = None
-            self._enc_spatial = None
-            enc_dim = enc_out.shape[1]
-            self.flatten = True
-
-        # Inspect decoder's first layer to decide adapter type
-        dec_first = None
-        try:
-            if len(self.decoder) > 0:
-                dec_first = self.decoder[0]
-        except Exception:
-            dec_first = None
-
-        self.adapter = None
-        # If decoder expects Conv2d input, prefer a Conv2d 1x1 adapter (preserve spatial dims)
-        if isinstance(dec_first, nn.Conv2d):
-            # If encoder gives 4D output, map channels -> expected in_channels
-            if self._enc_channels is not None:
-                enc_ch = self._enc_channels
-                dec_in_ch = dec_first.in_channels
-                if enc_ch != dec_in_ch:
-                    self.adapter = nn.Conv2d(enc_ch, dec_in_ch, kernel_size=1).to(device)
-            else:
-                # encoder produced flattened vector but decoder expects conv input
-                # we'll map flattened vector to channels and add spatial 1x1
-                dec_in_ch = dec_first.in_channels
-                self.adapter = nn.Linear(enc_dim, dec_in_ch).to(device)
-                # mark that we need to unflatten after linear adapter
-                self._unflatten_after_linear = True
-
-        # If decoder expects a Linear input (fully-connected), ensure adapter maps flattened dim
-        elif isinstance(dec_first, nn.Linear):
-            dec_in = dec_first.in_features
-            if enc_dim != dec_in:
-                self.adapter = nn.Linear(enc_dim, dec_in).to(device)
-
-        else:
-            # best-effort: if dims mismatch, add a Linear adapter between flattened enc and decoder
-            try:
-                dec_dim = enc_dim
-                if hasattr(dec_first, 'in_features'):
-                    dec_dim = dec_first.in_features
-                if enc_dim != dec_dim:
-                    self.adapter = nn.Linear(enc_dim, dec_dim).to(device)
-            except Exception:
-                self.adapter = None
-
-        # Try a dry-run through adapter+decoder with the dummy to ensure compatibility.
-        # If incompatible (common when stitching very different backbones), fall back
-        # to a simple classifier decoder (Flatten -> Linear) so hybrid can still run.
-        try:
+            print(f"  No adapter needed (shapes compatible)")
+        
+        # Validate the full pipeline
+        if not self._validate_pipeline(enc_out):
+            # If validation fails, create fallback pipeline
+            self._create_fallback_pipeline(enc_info, model_b)
+        elif getattr(self, '_decoder_needs_head', False):
+            # Add pooling + classifier head for ResNet-style decoders
+            num_classes = self._extract_num_classes(model_b)
+            # Determine decoder output channels by running a test forward
             with torch.no_grad():
                 test = enc_out
                 if self.adapter is not None:
                     if isinstance(self.adapter, nn.Conv2d):
                         test = self.adapter(test)
                     else:
-                        # linear adapter expects flat input
                         if test.ndim > 2:
                             test = test.view(test.size(0), -1)
                         test = self.adapter(test)
-                        if getattr(self, '_unflatten_after_linear', False):
-                            test = test.unsqueeze(-1).unsqueeze(-1)
-                _ = self.decoder(test)
-        except Exception:
-            # Fallback: replace decoder with a simple classifier so hybrid is usable.
-            num_classes = 10
-            try:
-                if hasattr(model_b, 'fc') and isinstance(model_b.fc, nn.Linear):
-                    num_classes = model_b.fc.out_features
-                elif hasattr(model_b, 'classifier') and isinstance(model_b.classifier, (nn.Sequential,)):
-                    last = model_b.classifier[-1]
-                    if isinstance(last, nn.Linear):
-                        num_classes = last.out_features
-            except Exception:
-                pass
-
-            # Ensure we map flattened encoder output to classifier input
-            self.adapter = None
-            self.decoder = nn.Sequential(nn.Flatten(1), nn.Linear(enc_dim, num_classes)).to(device)
-
-        # Ensure an adapter module exists so there's always something small to train.
-        # This guarantees `train_only` can enable adapter parameters and avoid the
-        # "no trainable parameters" situation.
-        if self.adapter is None:
-            try:
-                if isinstance(dec_first, nn.Conv2d):
-                    if self._enc_channels is not None:
-                        self.adapter = nn.Conv2d(self._enc_channels, dec_first.in_channels, kernel_size=1).to(device)
-                    else:
-                        # map flattened -> channels then unflatten
-                        self.adapter = nn.Linear(enc_dim, dec_first.in_channels).to(device)
-                        self._unflatten_after_linear = True
-                elif isinstance(dec_first, nn.Linear):
-                    dec_in = dec_first.in_features
-                    self.adapter = nn.Linear(enc_dim, dec_in).to(device)
-                else:
-                    # Best-effort linear adapter
-                    dec_dim = enc_dim
-                    if hasattr(dec_first, 'in_features'):
-                        dec_dim = dec_first.in_features
-                    if enc_dim != dec_dim:
-                        self.adapter = nn.Linear(enc_dim, dec_dim).to(device)
-            except Exception:
-                # leave adapter as None if creation fails
-                self.adapter = None
-
-        # Debugging info: small print to indicate adapter creation (helpful during runs)
+                dec_out = self.decoder(test)
+                out_channels = dec_out.shape[1] if dec_out.ndim == 4 else dec_out.shape[1]
+            
+            # Append pooling + classifier
+            self.decoder = nn.Sequential(
+                self.decoder,
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(1),
+                nn.Linear(out_channels, num_classes)
+            ).to(device)
+            print(f"  Added pooling+classifier head: {out_channels}→{num_classes}")
+        
+        # Debug info
+        self._print_adapter_info()
+    
+    def _determine_cut_points(self, children_a, children_b, cut_point, cut_by_half):
+        """Calculate where to cut both models at last convolutional block."""
+        # Find last Sequential block with Conv layers (exclude pooling and Linear)
+        def find_last_conv_block(children):
+            last_seq = -1
+            for i, layer in enumerate(children):
+                # Only consider Sequential layers with Conv2d
+                if isinstance(layer, nn.Sequential):
+                    has_conv = any(isinstance(m, nn.Conv2d) for m in layer.modules())
+                    if has_conv:
+                        last_seq = i
+                # Also consider standalone Conv2d layers
+                elif isinstance(layer, nn.Conv2d):
+                    last_seq = i
+            # If found conv blocks, return position after last one
+            # Otherwise return safe fallback
+            if last_seq >= 0:
+                return last_seq + 1
+            return max(1, len(children) - 2)
+        
+        usable_a = find_last_conv_block(children_a)
+        usable_b = find_last_conv_block(children_b)
+        
+        if cut_by_half or cut_point is None:
+            # Ensure at least 1 layer in encoder
+            cut_a = max(1, usable_a // 2)
+            cut_b = max(1, usable_b // 2)
+            return cut_a, cut_b
+        return max(1, min(int(cut_point), usable_a)), max(1, min(int(cut_point), usable_b))
+    
+    def _analyze_encoder_output(self, enc_out):
+        """Extract information about encoder output shape."""
+        enc_shape = enc_out.shape
+        enc_flat_dim = enc_out.view(enc_out.size(0), -1).shape[1]
+        
+        info = {
+            'shape': enc_shape,
+            'ndim': enc_out.ndim,
+            'flat_dim': enc_flat_dim,
+            'has_spatial': enc_out.ndim > 2
+        }
+        
+        if info['has_spatial']:
+            info.update({
+                'channels': enc_shape[1],
+                'spatial_dims': tuple(enc_shape[2:])
+            })
+        
+        return info
+    
+    def _get_first_meaningful_layer(self, module):
+        """Find first Conv2d or Linear layer in decoder."""
+        for m in module.modules():
+            if m is module:
+                continue
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                return m
+        return None
+    
+    def _create_compatible_adapter(self, enc_info, dec_first_layer):
+        """Create appropriate adapter based on encoder output and decoder input."""
+        # Case 1: Encoder has spatial dimensions
+        if enc_info['has_spatial']:
+            return self._create_spatial_adapter(enc_info, dec_first_layer)
+        # Case 2: Encoder is flattened
+        else:
+            return self._create_flattened_adapter(enc_info, dec_first_layer)
+    
+    def _create_spatial_adapter(self, enc_info, dec_first_layer):
+        """Create adapter for spatial (4D) encoder output."""
+        enc_ch = enc_info['channels']
+        
+        if isinstance(dec_first_layer, nn.Conv2d):
+            dec_in_ch = dec_first_layer.in_channels
+            if enc_ch != dec_in_ch:
+                return nn.Conv2d(enc_ch, dec_in_ch, kernel_size=1).to(self.device)
+        
+        elif isinstance(dec_first_layer, nn.Linear):
+            if enc_info['flat_dim'] != dec_first_layer.in_features:
+                return nn.Linear(enc_info['flat_dim'], dec_first_layer.in_features).to(self.device)
+        
+        return None
+    
+    def _create_flattened_adapter(self, enc_info, dec_first_layer):
+        """Create adapter for flattened (2D) encoder output."""
+        enc_dim = enc_info['flat_dim']
+        
+        if isinstance(dec_first_layer, nn.Conv2d):
+            # Need to map flattened to channels for Conv2d
+            dec_in_ch = dec_first_layer.in_channels
+            adapter = nn.Linear(enc_dim, dec_in_ch).to(self.device)
+            self._needs_unflatten = True
+            return adapter
+        
+        elif isinstance(dec_first_layer, nn.Linear):
+            if enc_dim != dec_first_layer.in_features:
+                return nn.Linear(enc_dim, dec_first_layer.in_features).to(self.device)
+        
+        # Default: small MLP adapter
+        hidden = max(64, min(512, enc_dim // 4))
+        return nn.Sequential(
+            nn.Linear(enc_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+        ).to(self.device)
+    
+    def _validate_pipeline(self, enc_out):
+        """Test if encoder -> adapter -> decoder works."""
         try:
-            if self.adapter is not None:
-                param_count = sum(p.numel() for p in self.adapter.parameters())
-                print(f'HybridModel: adapter created: {type(self.adapter).__name__}, params={param_count}')
-            else:
-                print('HybridModel: no adapter created (unexpected)')
-        except Exception:
-            pass
-
+            with torch.no_grad():
+                test = enc_out
+                if self.adapter is not None:
+                    # Apply adapter inline for validation
+                    if isinstance(self.adapter, nn.Conv2d):
+                        test = self.adapter(test)
+                    else:
+                        if test.ndim > 2:
+                            test = test.view(test.size(0), -1)
+                        test = self.adapter(test)
+                        if self._needs_unflatten:
+                            test = test.unsqueeze(-1).unsqueeze(-1)
+                print(f"  After adapter: {test.shape}")
+                result = self.decoder(test)
+                print(f"  After decoder: {result.shape}")
+                print(f"  ✓ Pipeline validation successful!")
+            return True
+        except Exception as e:
+            print(f"  ✗ Pipeline validation failed: {e}")
+            return False
+    
+    def _apply_adapter_forward(self, x):
+        """Apply adapter during forward pass (for validation)."""
+        if isinstance(self.adapter, nn.Conv2d):
+            return self.adapter(x)
+        else:
+            # Linear adapter
+            if x.ndim > 2:
+                x = x.view(x.size(0), -1)
+            x = self.adapter(x)
+            if getattr(self, '_needs_unflatten', False):
+                x = x.unsqueeze(-1).unsqueeze(-1)
+            return x
+    
+    def _create_fallback_pipeline(self, enc_info, model_b):
+        """Create simple fallback pipeline when stitching fails."""
+        print('Creating fallback pipeline...')
+        
+        # Get number of classes
+        num_classes = self._extract_num_classes(model_b)
+        enc_dim = enc_info['flat_dim']
+        
+        # Two-stage reduction for very large encoder outputs
+        if enc_dim > 10000:
+            hidden1 = 512
+            hidden2 = 128
+            self.adapter = nn.Sequential(
+                nn.Flatten(1),
+                nn.Linear(enc_dim, hidden1),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(hidden1, hidden2),
+                nn.ReLU(inplace=True)
+            ).to(self.device)
+            adapter_out = hidden2
+        else:
+            # Single-stage for smaller encoders
+            hidden = min(256, enc_dim // 4)
+            self.adapter = nn.Sequential(
+                nn.Flatten(1),
+                nn.Linear(enc_dim, hidden),
+                nn.ReLU(inplace=True)
+            ).to(self.device)
+            adapter_out = hidden
+        
+        # Replace decoder with simple classifier
+        self.decoder = nn.Sequential(
+            nn.Linear(adapter_out, num_classes)
+        ).to(self.device)
+    
+    def _extract_num_classes(self, model):
+        """Extract number of classes from model's head."""
+        if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+            return model.fc.out_features
+        elif hasattr(model, 'classifier') and isinstance(model.classifier, nn.Sequential):
+            last = model.classifier[-1]
+            if isinstance(last, nn.Linear):
+                return last.out_features
+        return 10  # Default for CIFAR-10
+    
+    def _print_adapter_info(self):
+        """Print debug information about adapter."""
+        if self.adapter is not None:
+            # Ensure adapter parameters are trainable
+            for p in self.adapter.parameters():
+                p.requires_grad = True
+            param_count = sum(p.numel() for p in self.adapter.parameters())
+            print(f'HybridModel: adapter created: {type(self.adapter).__name__}, params={param_count}')
+        else:
+            print('HybridModel: no adapter created')
+    
     def forward(self, x):
+        """Forward pass through encoder -> adapter -> decoder."""
         x = x.to(self.device)
         x = self.encoder(x)
-
-        # If encoder produced 4D and decoder expects Conv2d, keep 4D and apply conv adapter if present
-        if x.ndim > 2:
-            if self.adapter is not None:
-                # Conv2d adapter expects 4D input
-                if isinstance(self.adapter, nn.Conv2d):
-                    x = self.adapter(x)
-                else:
-                    # linear adapter: flatten, map, then unflatten to (B, C, 1, 1)
-                    x = x.view(x.size(0), -1)
-                    x = self.adapter(x)
-                    if getattr(self, '_unflatten_after_linear', False):
-                        # assume adapter output is channels; shape to (B, C, 1, 1)
-                        x = x.unsqueeze(-1).unsqueeze(-1)
-            # else: pass 4D through decoder (decoder's first layer should handle 4D)
-        else:
-            # encoder gave 2D output
-            if self.adapter is not None:
-                x = self.adapter(x)
-            else:
-                # if decoder expects conv input, try to reshape to (B, C, 1, 1)
-                try:
-                    first_layer = self.decoder[0]
-                    if isinstance(first_layer, nn.Conv2d):
-                        # best-effort: treat second dim as channels
-                        x = x.unsqueeze(-1).unsqueeze(-1)
-                except Exception:
-                    pass
-
+        
+        if self.adapter is not None:
+            x = self._apply_adapter_forward(x)
+        
         x = self.decoder(x)
         return x
 
 
 def freeze(model: nn.Module):
+    """Freeze all parameters in a model."""
     for param in model.parameters():
         param.requires_grad = False
 
 
 def unfreeze_all(model: nn.Module):
+    """Unfreeze all parameters in a model."""
     for param in model.parameters():
         param.requires_grad = True
 
 
-def train_only(model: HybridModel, adapter: nn.Module | None):
-    # Freeze encoder and decoder by default
+def train_only_adapter(model: HybridModel):
+    """Freeze encoder and decoder, only train adapter."""
     freeze(model.encoder)
     freeze(model.decoder)
-
-    # If an explicit adapter exists, enable only its parameters
-    if adapter is not None:
-        for p in adapter.parameters():
+    
+    if model.adapter is not None:
+        for p in model.adapter.parameters():
             p.requires_grad = True
-        return
-
-    # No explicit adapter: try to find a reasonable "connecting" layer in decoder
-    # and enable only its parameters (e.g., last Linear in decoder or first Linear)
-    try:
-        # prefer first Linear (after possible Flatten)
-        for module in model.decoder.modules():
-            if isinstance(module, nn.Linear):
-                for p in module.parameters():
-                    p.requires_grad = True
-                return
-        # fallback: if decoder is a Sequential and its last module is Linear
-        if isinstance(model.decoder, nn.Sequential) and len(model.decoder) > 0:
-            last = model.decoder[-1]
-            if isinstance(last, nn.Linear):
-                for p in last.parameters():
-                    p.requires_grad = True
-                return
-    except Exception:
-        pass
-
-    # As a last resort, enable any parameter in decoder (least preferred)
-    for p in model.decoder.parameters():
-        p.requires_grad = True
+    else:
+        print('Warning: No adapter found to train')
 
 
 def train_entire_model(model: nn.Module):
+    """Unfreeze all parameters in a model."""
     unfreeze_all(model)
 
 
-# Dataset helpers (create datasets/loaders lazily to avoid download side-effects at import)
-def make_default_transform(resize: int = 224):
-    return transforms.Compose([
-        transforms.Resize(resize),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+def enable_head(model: nn.Module) -> int:
+    """Enable (set requires_grad=True) for a model's classifier head parameters."""
+    enabled = 0
+    try:
+        if hasattr(model, 'classifier') and isinstance(model.classifier, (nn.Sequential,)):
+            last = model.classifier[-1]
+            if isinstance(last, nn.Linear):
+                for p in last.parameters():
+                    p.requires_grad = True
+                enabled += sum(p.numel() for p in last.parameters())
+        if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+            for p in model.fc.parameters():
+                p.requires_grad = True
+            enabled += sum(p.numel() for p in model.fc.parameters())
+        if enabled == 0:
+            # fallback: find last Linear
+            for name, module in reversed(list(model.named_modules())):
+                if isinstance(module, nn.Linear):
+                    for p in module.parameters():
+                        p.requires_grad = True
+                    enabled += sum(p.numel() for p in module.parameters())
+                    break
+    except Exception:
+        pass
+    return enabled
 
 
-def get_cifar10_loader(root: str = './data', train: bool = True, batch_size: int = 64, shuffle: bool = True, download: bool = True, transform=None):
-    if transform is None:
-        transform = make_default_transform()
-    ds = CIFAR10(root=root, train=train, download=download, transform=transform)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-
-
-def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device | None = None) -> float:
+def train_head(model: nn.Module, epochs: int = 5, dataloader: DataLoader | None = None, 
+               device: torch.device | None = None, lr: float = 1e-3):
+    """Freeze all parameters and train only the model head."""
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            if outputs.ndim == 1:
-                # single-value output: skip
-                continue
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    return correct / total if total > 0 else 0.0
-
-
-def train_model(model: nn.Module, epochs: int = 1, dataloader: DataLoader | None = None, device: torch.device | None = None):
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    if dataloader is None:
-        dataloader = get_cifar10_loader()
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if len(trainable_params) == 0:
-        print('No trainable parameters found (all parameters are frozen). Skipping training.')
+    
+    # Freeze everything
+    freeze(model)
+    
+    # Enable head params
+    num_enabled = enable_head(model)
+    if num_enabled == 0:
+        print('train_head: no head parameters found to train.')
         return
-    optimizer = torch.optim.Adam(trainable_params, lr=0.001)
+    
+    # Use provided dataloader or default
+    if dataloader is None:
+        dataloader = get_cifar10_loader(train=True, download=True, batch_size=64)
+    
+    # Build optimizer only for head params
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(params, lr=lr)
     criterion = nn.CrossEntropyLoss()
+    
+    model.to(device)
     model.train()
+    
+    history = {'loss': []}
     for epoch in range(epochs):
         running_loss = 0.0
         for inputs, labels in dataloader:
@@ -368,12 +480,196 @@ def train_model(model: nn.Module, epochs: int = 1, dataloader: DataLoader | None
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-        print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader):.4f}")
+        
+        avg_loss = running_loss / len(dataloader)
+        history['loss'].append(avg_loss)
+        print(f"Head Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+    
+    # After training, set model to eval mode
+    model.eval()
+    return history
 
 
-def to_device(model: nn.Module, device: torch.device):
+def make_default_transform(resize: int = 224):
+    """Create default transform with ImageNet normalization."""
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+    return transforms.Compose([
+        transforms.Resize(resize),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
+    ])
+
+
+def get_cifar10_loader(root: str = './data', train: bool = False, batch_size: int = 64, 
+                       shuffle: bool = True, download: bool = True, transform=None):
+    """Create DataLoader for CIFAR-10."""
+    if transform is None:
+        transform = make_default_transform()
+    ds = CIFAR10(root=root, train=train, download=download, transform=transform)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
+
+
+def evaluate(model: nn.Module, dataloader: DataLoader, device: torch.device | None = None) -> float:
+    """Evaluate model accuracy on a dataloader."""
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     model.to(device)
+    model.eval()
+    
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            
+            if outputs.ndim == 1:
+                continue  # single-value output: skip
+            
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    return correct / total if total > 0 else 0.0
 
 
-def move_batch_to_device(inputs, labels, device: torch.device):
-    return inputs.to(device), labels.to(device)
+def train_model(model: nn.Module, epochs: int = 5, dataloader: DataLoader | None = None, 
+                device: torch.device | None = None, lr: float = 0.001):
+    """Generic training function for any model. Returns training history."""
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    model.to(device)
+    
+    if dataloader is None:
+        dataloader = get_cifar10_loader(train=True, download=True, batch_size=64)
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        print('No trainable parameters found. Skipping training.')
+        return {'loss': []}
+    
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    
+    model.train()
+    
+    history = {'loss': []}
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        
+        avg_loss = running_loss / len(dataloader)
+        history['loss'].append(avg_loss)
+        print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+    
+    model.eval()
+    return history
+
+
+def collect_activation_stats(model: nn.Module, sample_batch: torch.Tensor, 
+                            device: torch.device | None = None, max_modules: int | None = 200):
+    """Collect mean absolute activation per module for a single forward pass."""
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    model = model.to(device)
+    model.eval()
+    
+    stats: dict[str, float] = {}
+    handles = []
+    
+    def make_hook(name):
+        def hook(module, inp, out):
+            try:
+                a = out.detach()
+                stats[name] = float(a.abs().mean().cpu().item())
+            except Exception:
+                stats[name] = float(0.0)
+        return hook
+    
+    # Register hooks on Conv2d and Linear modules
+    count = 0
+    for name, module in model.named_modules():
+        if module is model:
+            continue
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            handles.append(module.register_forward_hook(make_hook(name)))
+            count += 1
+            if max_modules is not None and count >= max_modules:
+                break
+    
+    # Run forward with a single batch
+    with torch.no_grad():
+        sample = sample_batch.to(device)
+        try:
+            _ = model(sample)
+        except Exception:
+            # Try flattening per-sample
+            try:
+                s = sample.view(sample.size(0), -1).to(device)
+                _ = model(s)
+            except Exception:
+                pass
+    
+    # Remove hooks
+    for h in handles:
+        h.remove()
+    
+    return stats
+
+
+def plot_activation_stats(stats: dict[str, float], title: str, out_path: str, top_k: int | None = 50):
+    """Plot a bar chart of the top_k modules by mean-abs activation and save PNG."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        # matplotlib not available; write CSV fallback
+        import csv
+        dirpath = os.path.dirname(out_path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        with open(out_path.replace('.png', '.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['module', 'mean_abs_activation'])
+            for k, v in stats.items():
+                w.writerow([k, v])
+        return
+    
+    items = sorted(stats.items(), key=lambda kv: kv[1], reverse=True)
+    if top_k is not None:
+        items = items[:top_k]
+    
+    names = [k for k, _ in items]
+    values = [v for _, v in items]
+    
+    dirpath = os.path.dirname(out_path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    
+    plt.figure(figsize=(max(6, len(names) * 0.25), 6))
+    plt.barh(range(len(names))[::-1], values, align='center')
+    plt.yticks(range(len(names))[::-1], names, fontsize=8)
+    plt.xlabel('Mean abs activation')
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+def get_sample_batch(batch_size: int = 8, resize: int = 224):
+    """Return a single batch from CIFAR-10 test split using default transform."""
+    loader = get_cifar10_loader(train=False, download=True, batch_size=batch_size)
+    for xb, yb in loader:
+        return xb
+    raise RuntimeError('Could not load sample batch')
