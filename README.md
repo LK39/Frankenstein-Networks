@@ -1,4 +1,4 @@
-# Frankenstein
+# Frankenstein Networks
 
 Hybrid neural network combining EfficientNet-B0 and ResNet-18, connected via trainable adapter.
 
