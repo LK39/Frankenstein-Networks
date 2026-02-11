@@ -155,4 +155,218 @@ Adapter-Only Accuracy: 0.7696
 ==================================================
 Final Results: Eff=0.8160 | Bias=0.8049 | Hybrid=0.7696
 ==================================================
+
+
+================================================================================
+HYBRID MODEL OPTIMIZATION USING LAYER MATCHING FRAMEWORK
+================================================================================
+
+Loading models...
+✓ Model A (efficientnet.pth): 3 top-level layers
+✓ Model B (biasnn.pth): 10 top-level layers
+
+================================================================================
+ANALYZING ALL CUT POINTS
+================================================================================  
+
+Analyzing: A[0:1] → B[0:]
+  Layer A shape: (1280, 320)
+  Layer B shape: (64, 147)
+  Overall Match: 47.8%
+  Metrics: AAS=0.911, CUR=0.469, RM=0.124, GFE=0.000
+
+Analyzing: A[0:1] → B[1:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:1] → B[2:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:1] → B[3:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:1] → B[4:]
+  Layer A shape: (1280, 320)
+  Layer B shape: (64, 576)
+  Overall Match: 48.1%
+  Metrics: AAS=0.954, CUR=0.422, RM=0.041, GFE=0.104
+
+Analyzing: A[0:1] → B[5:]
+  Layer A shape: (1280, 320)
+  Layer B shape: (128, 576)
+  Overall Match: 47.0%
+  Metrics: AAS=0.962, CUR=0.344, RM=0.031, GFE=0.150
+
+Analyzing: A[0:1] → B[6:]
+  Layer A shape: (1280, 320)
+  Layer B shape: (256, 1152)
+  Overall Match: 46.7%
+  Metrics: AAS=0.957, CUR=0.352, RM=0.034, GFE=0.088
+
+Analyzing: A[0:1] → B[7:]
+  Layer A shape: (1280, 320)
+  Layer B shape: (512, 2304)
+  Overall Match: 50.0%
+  Metrics: AAS=0.948, CUR=0.529, RM=0.045, GFE=0.072
+
+Analyzing: A[0:1] → B[8:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[0:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[1:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[2:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[3:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[4:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[5:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[6:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[7:]
+  ⚠ No extractable weights, skipping
+
+Analyzing: A[0:2] → B[8:]
+  ⚠ No extractable weights, skipping
+
+================================================================================  
+BEST CUT POINT FOUND
+================================================================================  
+Cut A at: 1
+Cut B at: 7
+Overall Score: 50.0%
+Metrics:
+  AAS: 0.948
+  CUR: 0.529
+  RM: 0.045
+  GFE: 0.072
+  IPI: 0.376
+  ASM: 1.000
+
+================================================================================  
+GENERATING VISUALIZATIONS
+================================================================================  
+✓ Visualizations saved
+✓ Report saved to hybrid_analysis_results\hybrid_optimization_report.txt
+
+================================================================================  
+COMPARING BASELINE VS OPTIMIZED HYBRID
+================================================================================  
+
+>>> Creating BASELINE hybrid (cut both in half)...
+
+Hybrid Construction:
+  Model A: 3 layers, using first 1
+  Model B: 10 layers, using last 6
+  Decoder: using 4 convolutional blocks, will add pooling+classifier
+  Encoder output: torch.Size([1, 1280, 7, 7])
+  Decoder first layer: Conv2d
+    Expects Conv2d input: in_channels=64
+  Adapter created: Conv2d
+  After adapter: torch.Size([1, 64, 7, 7])
+  After decoder: torch.Size([1, 512, 1, 1])
+  ✓ Pipeline validation successful!
+  Added pooling+classifier head: 512→10
+HybridModel: adapter created: Conv2d, params=81984
+
+==================================================
+Baseline Hybrid Summary
+==================================================
+Total params: 15,261,638
+Trainable params: 15,261,638
+Non-trainable params: 0
+
+Encoder: 4,007,548 | Adapter: 81,984 | Decoder: 11,172,106
+==================================================
+Training baseline adapter...
+Epoch 1, Loss: 2.2730
+Epoch 2, Loss: 2.0559
+Epoch 3, Loss: 1.9357
+Epoch 4, Loss: 1.8668
+Epoch 5, Loss: 1.8297
+Epoch 6, Loss: 1.7906
+Epoch 7, Loss: 1.7620
+Epoch 8, Loss: 1.7412
+Epoch 9, Loss: 1.7211
+Epoch 10, Loss: 1.7086
+Epoch 11, Loss: 1.6943
+Epoch 12, Loss: 1.6736
+Epoch 13, Loss: 1.6688
+Epoch 14, Loss: 1.6557
+Epoch 15, Loss: 1.6448
+Baseline Accuracy: 52.73%
+
+>>> Creating OPTIMIZED hybrid (A:1, B:7)...
+
+Hybrid Construction:
+  Model A: 3 layers, using first 1
+  Model B: 10 layers, using last 3
+  Decoder: using 1 convolutional blocks, will add pooling+classifier
+  Encoder output: torch.Size([1, 1280, 7, 7])
+  Decoder first layer: Conv2d
+    Expects Conv2d input: in_channels=256
+  Adapter created: Conv2d
+  After adapter: torch.Size([1, 256, 7, 7])
+  After decoder: torch.Size([1, 512, 4, 4])
+  ✓ Pipeline validation successful!
+  Added pooling+classifier head: 512→10
+HybridModel: adapter created: Conv2d, params=327936
+
+==================================================
+Optimized Hybrid Summary
+==================================================
+Total params: 12,734,342
+Trainable params: 12,734,342
+Non-trainable params: 0
+
+Encoder: 4,007,548 | Adapter: 327,936 | Decoder: 8,398,858
+==================================================
+Training optimized adapter...
+Epoch 1, Loss: 1.0122
+Epoch 2, Loss: 0.7589
+Epoch 3, Loss: 0.6887
+Epoch 4, Loss: 0.6565
+Epoch 5, Loss: 0.6226
+Epoch 6, Loss: 0.6059
+Epoch 7, Loss: 0.5864
+Epoch 8, Loss: 0.5733
+Epoch 9, Loss: 0.5600
+Epoch 10, Loss: 0.5562
+Epoch 11, Loss: 0.5439
+Epoch 12, Loss: 0.5340
+Epoch 13, Loss: 0.5295
+Epoch 14, Loss: 0.5206
+Epoch 15, Loss: 0.5147
+Optimized Accuracy: 84.27%
+
+================================================================================  
+RESULTS COMPARISON
+================================================================================  
+Baseline Hybrid:  52.73%
+Optimized Hybrid: 84.27%
+Improvement:      +31.54%
+
+✓ Layer matching analysis successfully improved hybrid performance!
+
+✓ Comparison plot saved to hybrid_analysis_results\hybrid_comparison.png
+
+================================================================================  
+ANALYSIS COMPLETE!
+================================================================================  
+Results saved to: hybrid_analysis_results/
+  • cut_point_heatmap.png - Match scores for all configurations
+  • best_cut_point_analysis.png - Detailed analysis of optimal cut
+  • top_cut_points_comparison.png - Top 5 configurations compared
+  • hybrid_comparison.png - Performance comparison
+  • hybrid_optimization_report.txt - Detailed text report
+
 ```
